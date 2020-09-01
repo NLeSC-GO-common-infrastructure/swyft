@@ -12,7 +12,7 @@ def simulate(simulator: Callable[[Tensor,], Tensor], z: Tensor) -> Tensor:
     return torch.cat([simulator(zz) for zz in z], dim=0)  # TODO make a batched version of this.
 
 
-class Warehouse(object):
+class Round(object):
     # The idea is to store everything in lists which are identified by rounds and the associated estimators (or model params)
     # Does it take in a simulator? It should be connected with a simulator I believe.
     def __init__(
@@ -20,8 +20,8 @@ class Warehouse(object):
         x: Optional[Tensor] = None, 
         z: Optional[Tensor] = None, 
         rounds: Optional[Tensor] = None, 
-        likelihood_estimator: Optional[nn.Module] = None
-    ,):
+        likelihood_estimator: Optional[nn.Module] = None,
+    ):
         super().__init__()
     
     @property
@@ -60,7 +60,60 @@ class Warehouse(object):
         rounds: Optional[Tensor] = None, 
         likelihood_estimator: Optional[nn.Module] = None,
     ) -> None:
-        # Should allow the addition of new data and estimators to the warehouse. 
+        # Should allow the addition of new data and estimators to the RoundCache. 
+        # Perhaps some saftey checks so that the user doesn't add two sets of zs before an x or something.
+        raise NotImplementedError
+
+
+class RoundCache(object):
+    # The idea is to store everything in lists which are identified by rounds and the associated estimators (or model params)
+    # Does it take in a simulator? It should be connected with a simulator I believe.
+    def __init__(
+        self,
+        x: Optional[Tensor] = None, 
+        z: Optional[Tensor] = None, 
+        rounds: Optional[Tensor] = None, 
+        likelihood_estimator: Optional[nn.Module] = None,
+    ):
+        super().__init__()
+    
+    @property
+    def x(self) -> Sequence[Tensor]:
+        raise NotImplementedError
+
+    @property
+    def z(self) -> Sequence[Tensor]:
+        raise NotImplementedError
+    
+    @property
+    def rounds(self) -> Sequence[Tensor]:
+        # A sequence which shows which round a particular sample was initially drawn in. Has the same samples per round as x or z
+        raise NotImplementedError
+    
+    @property
+    def likelihood_estimators(self) -> Sequence[nn.Module]:
+        raise NotImplementedError
+
+    def get_dataset(
+        self,
+        subset_percents: Iterable[float] = (1.0,),
+    ) -> Union[Dataset, Sequence[Dataset]]:
+        raise NotImplementedError
+
+    def get_dataloader(
+        self,
+        percent_train: Iterable[float] = (1.0,),
+    ) -> Union[DataLoader, Sequence[Dataset]]:
+        raise NotImplementedError
+
+    def append(
+        self,
+        x: Optional[Tensor] = None, 
+        z: Optional[Tensor] = None, 
+        rounds: Optional[Tensor] = None, 
+        likelihood_estimator: Optional[nn.Module] = None,
+    ) -> None:
+        # Should allow the addition of new data and estimators to the RoundCache. 
         # Perhaps some saftey checks so that the user doesn't add two sets of zs before an x or something.
         raise NotImplementedError
 
