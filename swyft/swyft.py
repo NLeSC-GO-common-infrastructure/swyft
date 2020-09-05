@@ -1,11 +1,11 @@
 # pylint: disable=no-member, not-callable
+from copy import deepcopy
+
 import numpy as np
-from tqdm import tqdm
 import torch
 import torch.nn as nn
-from .core import *
 
-from copy import deepcopy
+from .core import *
 
 class Data(torch.utils.data.Dataset):
     def __init__(self, xz):
@@ -25,7 +25,7 @@ def gen_train_data(model, nsamples, zdim, mask = None):
     else:
         z = sample_constrained_hypercube(nsamples, zdim, mask)
     
-    xz = simulate_xz(model, z)
+    xz = simulate(model, z)
     dataset = Data(xz)
     
     return dataset
@@ -85,15 +85,15 @@ class SWYFT:
         # Initialize neural network
         if self.head_cls is None and head is None:
             head = None
-            ydim = len(self.x0)
+            xdim = len(self.x0)
         elif head is not None:
-            ydim = head(self.x0.unsqueeze(0).to(self.device)).shape[1]
-            print("Number of output features:", ydim)
+            xdim = head(self.x0.unsqueeze(0).to(self.device)).shape[1]
+            print("Number of output features:", xdim)
         else:
             head = self.head_cls()
-            ydim = head(self.x0.unsqueeze(0)).shape[1]
-            print("Number of output features:", ydim)
-        net = Network(ydim = ydim, pnum = pnum, pdim = pdim, head = head).to(self.device)
+            xdim = head(self.x0.unsqueeze(0)).shape[1]
+            print("Number of output features:", xdim)
+        net = Network(xdim = xdim, pnum = pnum, pdim = pdim, head = head).to(self.device)
         return net
 
     def append_dataset(self, dataset):

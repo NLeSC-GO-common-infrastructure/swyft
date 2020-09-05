@@ -1,40 +1,22 @@
 # pylint: disable=no-member, not-callable
-from typing import Callable
+from typing import Callable, Collection, Optional
 from copy import deepcopy
-from warnings import warn
 from contextlib import nullcontext
-
 from collections import defaultdict
-import math
+from warnings import warn
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch import Tensor
 
-from tqdm import tqdm
-
+from .types import Array, Tensor
+from .utils import get_device_if_not_none, array_to_tensor
 
 #######################
 # Convenience functions
 #######################
 
-#def sortbyfirst(x, y):
-#    """Sort two lists by values of first list."""
-#    i = np.argsort(x)
-#    return x[i], y[i]
-#
-#def subsample(n_sub, z, replace = False):
-#    """Subsample lists."""
-#    if n_sub is None:
-#        return z
-#    if n_sub >= len(z) and not replace:
-#        raise ValueError("Number of sub-samples without replacement larger than sample size")
-#    indices = np.random.choice(len(z), size = n_sub, replace = replace)
-#    z_sub = [z[i] for i in indices]
-#    return z_sub
-
-def combine_z(z, combinations):
+def combine_z(z: Array, combinations: Collection) -> Tensor:
     """Generate parameter combinations in last dimension. 
     Requires: z.ndim == 1. 
     output.shape == (n_posteriors, parameter shape)
@@ -44,24 +26,11 @@ def combine_z(z, combinations):
     else:
         return torch.stack([z[c] for c in combinations])
 
-def set_device(gpu: bool = False) -> torch.device:
-    if gpu and torch.cuda.is_available():
-        device = torch.device("cuda")
-        torch.set_default_tensor_type("torch.cuda.FloatTensor")
-    elif gpu and not torch.cuda.is_available():
-        warn("Although the gpu flag was true, the gpu is not avaliable.")
-        device = torch.device("cpu")
-        torch.set_default_tensor_type("torch.FloatTensor")
-    else:
-        device = torch.device("cpu")
-        torch.set_default_tensor_type("torch.FloatTensor")
-    return device
-
 #########################
 # Generate sample batches
 #########################
 
-def sample_hypercube(num_samples: int, num_params: int) -> Tensor:
+def sample_hypercube(num_samples: int, num_params: int) -> Array:
     """Return uniform samples from the hyper cube.
 
     Args:
@@ -73,47 +42,51 @@ def sample_hypercube(num_samples: int, num_params: int) -> Tensor:
     """
     return torch.rand(num_samples, num_params)
 
-def simulate_xz(model, list_z):
+def simulate(model: Callable[[Array], Array], z: Tensor) -> Tensor:
     """Generates x ~ model(z).
     
     Args:
-        model (fn): foreward model, returns samples x~p(x|z).
-            Both x and z have to be Tensors.
-        list_z (list of Tensors): list of model parameters z.
+        model: forward model, returns shape (M).
+        z: samples z~p(z).
 
     Returns:
-        list of dict: list of dictionaries with 'x' and 'z' pairs.
+        x: samples x~p(x|z)
     """
+    num_simulations, *_  = z.shape
 
-    # TODO: Change format to (x, z) tuples rather than dictionary
+    if num_simulations == 0:
+        warn("Simulating z with shape = (0, ...) means no simulation.")
+        return torch.tensor([])
+    else:
+        x_list = []
+        try:
+            x0 = model(z[0])
+            x0 = array_to_tensor(x0)
+            input_device = z.device
+        except TypeError:
+            x0 = model(z[0].cpu())
+            x0 = array_to_tensor(x0)
+            input_device = torch.device('cpu')
 
-    list_xz = []
-    for z in list_z:
-        x = model(z.numpy())
-        x = torch.tensor(x).float()
-        list_xz.append(dict(x=x, z=z))
-    return list_xz
-
-def get_x(list_xz):
-    """Extract x from batch of samples."""
-    return [xz['x'] for xz in list_xz]
-
-def get_z(list_xz):
-    """Extract z from batch of samples."""
-    return [xz['z'] for xz in list_xz]
-
+        x_list.append(x0)
+        for zz in z[1:]:
+            x = model(zz.to(device=input_device))
+            x = array_to_tensor(x)
+            x_list.append(x)
+        return torch.stack(x_list)
 
 ##########
 # Training
 ##########
 
-def loss_fn(network, xz, combinations = None):
+def loss_fn(network: nn.Module, x: Tensor, z: Tensor, combinations: Optional[Collection] = None):
     """Evaluate binary-cross-entropy loss function. Mean over batch.
 
     Args:
-        network (nn.Module): network taking minibatch of samples and returing ratio estimator.
-        xz (dict): batch of samples to train on.
-        combinations (list, optional): determines posteriors that are generated.
+        network: network taking minibatch of samples and returing ratio estimator.
+        x: samples x~p(x|z)
+        z: samples z~p(z).
+        combinations: determines posteriors that are generated.
             examples:
                 [[0,1], [3,4]]: p(z_0,z_1) and p(z_3,z_4) are generated
                     initialize network with zdim = 2, pdim = 2
@@ -121,26 +94,24 @@ def loss_fn(network, xz, combinations = None):
                     initialize network with zdim = 1, pdim = 4
 
     Returns:
-        Tensor: training loss.
+        training loss.
     """ #TODO does the loss function depend on which distribution the z was drawn from? it does in SBI for the SNPE versions
-    assert xz['x'].size(0) == xz['z'].size(0), "Number of x and z must be equal."
-    assert xz['x'].size(0) % 2 == 0, "There must be an even number of samples in the batch for contrastive learning."
-    n_batch = xz['x'].size(0)
+    assert x.size(0) == z.size(0), "Number of x and z must be equal."
+    assert x.size(0) % 2 == 0, "There must be an even number of samples in the batch for contrastive learning."
+    n_batch = x.size(0)
 
     # Is it the removal of replacement that made it stop working?!
 
     # bring x into shape
     # (n_batch*2, data-shape)  - repeat twice each sample of x - there are n_batch samples
     # repetition pattern in first dimension is: [a, a, b, b, c, c, d, d, ...]
-    x = xz['x']
     x = torch.repeat_interleave(x, 2, dim = 0)
 
     # bring z into shape
     # (n_batch*2, param-shape)  - repeat twice each sample of z - there are n_batch samples
     # repetition is alternating in first dimension: [a, b, a, b, c, d, c, d, ...]
-    z = xz['z']
     z = torch.stack([combine_z(zs, combinations) for zs in z])
-    zdim = len(z[0])
+    zdim = z.size(1)
     z = z.view(n_batch // 2, -1, *z.shape[-1:])
     z = torch.repeat_interleave(z, 2, dim = 0)
     z = z.view(n_batch*2, -1, *z.shape[-1:])
@@ -205,7 +176,7 @@ def train(
                 optimizer.zero_grad()
                 if device is not None:
                     batch = {k: v.to(device, non_blocking=non_blocking) for k, v in batch.items()}
-                loss = loss_fn(network, batch, combinations = combinations)
+                loss = loss_fn(network, batch['x'], batch['z'], combinations = combinations)
                 if train:
                     loss.backward()
                     optimizer.step()
@@ -262,7 +233,7 @@ def get_lnL(net, x0, z, n_batch = 64):
     nsamples = len(z)
 
     lnL = []
-    for i in tqdm(range(nsamples//n_batch+1)):
+    for i in range(nsamples//n_batch+1):
         zbatch = z[i*n_batch:(i+1)*n_batch]
         lnL += net(x0.unsqueeze(0), zbatch).detach().cpu()
 
@@ -286,32 +257,32 @@ class LinearWithChannel(nn.Module):
         self.reset_parameters(self.w, self.b)
 
     def reset_parameters(self, weights, bias):
-        torch.nn.init.kaiming_uniform_(weights, a=math.sqrt(3))
+        torch.nn.init.kaiming_uniform_(weights, a=np.sqrt(3))
         fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(weights)
-        bound = 1 / math.sqrt(fan_in)
+        bound = 1 / np.sqrt(fan_in)
         torch.nn.init.uniform_(bias, -bound, bound)
 
     def forward(self, x):
         x = x.unsqueeze(-1)
         return torch.matmul(self.w, x).squeeze(-1) + self.b
     
-def combine(y, z):
-    """Combines data vectors y and parameter vectors z.
+def combine(x, z):
+    """Combines data vectors x and parameter vectors z.
     
     z : (..., pnum, pdim)
-    y : (..., ydim)
+    x : (..., xdim)
     
-    returns: (..., pnum, ydim + pdim)
+    returns: (..., pnum, xdim + pdim)
     
     """
-    y = y.unsqueeze(-2) # (..., 1, ydim)
-    y = y.expand(*z.shape[:-1], *y.shape[-1:]) # (..., pnum, ydim)
-    return torch.cat([y, z], -1)
+    x = x.unsqueeze(-2) # (..., 1, xdim)
+    x = x.expand(*z.shape[:-1], *x.shape[-1:]) # (..., pnum, xdim)
+    return torch.cat([x, z], -1)
 
 class DenseLegs(nn.Module):
-    def __init__(self, ydim, pnum, pdim = 1, p = 0.0, NH = 256):
+    def __init__(self, xdim, pnum, pdim = 1, p = 0.0, NH = 256):
         super().__init__()
-        self.fc1 = LinearWithChannel(ydim+pdim, NH, pnum)
+        self.fc1 = LinearWithChannel(xdim+pdim, NH, pnum)
         self.fc2 = LinearWithChannel(NH, NH, pnum)
         self.fc3 = LinearWithChannel(NH, NH, pnum)
         self.fc4 = LinearWithChannel(NH, 1, pnum)
@@ -322,8 +293,8 @@ class DenseLegs(nn.Module):
         # swish activation function for smooth posteriors
         self.af2 = lambda x: x*torch.sigmoid(x)
 
-    def forward(self, y, z):
-        x = combine(y, z)
+    def forward(self, x, z):
+        x = combine(x, z)
         x = self.af(self.fc1(x))
         x = self.drop(x)
         x = self.af(self.fc2(x))
@@ -342,10 +313,10 @@ def get_norms(xz):
     return x_mean, x_var**0.5, z_mean, z_var**0.5
 
 class Network(nn.Module):
-    def __init__(self, ydim, pnum, pdim = 1, xz_init = None, head = None, p = 0.):
+    def __init__(self, xdim, pnum, pdim = 1, xz_init = None, head = None, p = 0.):
         """Base network combining z-independent head and parallel tail.
 
-        :param ydim: Number of data dimensions going into DenseLeg network
+        :param xdim: Number of data dimensions going into DenseLeg network
         :param pnum: Number of posteriors to estimate
         :param pdim: Dimensionality of posteriors
         :param xz_init: xz Samples used for normalization
@@ -357,16 +328,16 @@ class Network(nn.Module):
         """
         super().__init__()
         self.head = head
-        self.legs = DenseLegs(ydim, pnum, pdim = pdim, p = p)
+        self.legs = DenseLegs(xdim, pnum, pdim = pdim, p = p)
         
         if xz_init is not None:
             x_mean, x_std, z_mean, z_std = get_norms(xz_init)
         else:
             x_mean, x_std, z_mean, z_std = 0., 1., 0., 1.
-        self.x_mean = torch.nn.Parameter(torch.tensor(x_mean).float())
-        self.z_mean = torch.nn.Parameter(torch.tensor(z_mean).float())
-        self.x_std = torch.nn.Parameter(torch.tensor(x_std).float())
-        self.z_std = torch.nn.Parameter(torch.tensor(z_std).float())
+        self.x_mean = torch.nn.Parameter(array_to_tensor(x_mean))
+        self.z_mean = torch.nn.Parameter(array_to_tensor(z_mean))
+        self.x_std = torch.nn.Parameter(array_to_tensor(x_std))
+        self.z_std = torch.nn.Parameter(array_to_tensor(z_std))
     
     def forward(self, x, z):
         #TODO : Bring normalization back
@@ -404,7 +375,7 @@ def iter_sample_z(n_draws, zdim, net, x0, verbosity = False, threshold = 1e-6):
         zlnL = estimate_lnL(net, x0, z)
         for i in range(zdim):
             mask = zlnL[i]['lnL'] > np.log(threshold)
-            frac[i] = np.true_divide(sum(mask),len(mask))
+            frac[i] = np.true_divide(sum(mask), len(mask))
             zout[i].append(zlnL[i]['z'][mask])
             counter[i] += mask.sum()
         done = min(counter) >= n_draws
