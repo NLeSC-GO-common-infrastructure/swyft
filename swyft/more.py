@@ -1,11 +1,12 @@
 # pylint: disable=no-member
-from .types import Array, Shape, ScalarFloat
+from .types import Array, Shape, ScalarFloat, Tensor
 from typing import Optional, Union, Callable, Iterable, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+# TODO change everything to zdim and znum rather than pdim and pnum.
 
 class Round(object):
     # The idea is to store everything in lists which are identified by rounds and the associated estimators (or model params)
@@ -113,11 +114,6 @@ class DataCache(object):
         generator = torch.Generator() if seed is None else torch.Generator().manual_seed(seed)
         return torch.utils.data.random_split(dataset, subset_lengths, generator=generator)
 
-def get_masking_fn(likelihood_estimator: nn.Module, x0: Array, threshold: float) -> Callable[[Array,], Array]:
-    # Return a function which classifies parameters as above or below the threshold, i.e. returns a boolean tensor
-    raise NotImplementedError
-
-
 def apply_mask(
     masking_fn: Callable[[Array,], Array], 
     x: Array,
@@ -129,8 +125,8 @@ def apply_mask(
 
 
 def sample(
-    n_samples = int,
-    n_dim = int,
+    n_samples: int,
+    n_dim: int,
     masking_fn: Optional[Callable[[Array,], Array]] = None,
     existing_z: Optional[Array] = None,
     existing_rounds: Optional[Array] = None,

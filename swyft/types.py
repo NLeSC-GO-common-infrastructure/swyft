@@ -10,6 +10,6 @@ from typing import Union, Tuple
 Tensor = torch.Tensor
 Device = Union[torch.device, str]
 
-Array = Union[np.ndarray, torch.Array]
+Array = Union[np.ndarray, torch.Tensor]
 Shape = Union[torch.Size, Tuple[int, ...]]
-ScalarFloat = Union[torch.Array, float]
+ScalarFloat = Union[np.ndarray, torch.Tensor, float]

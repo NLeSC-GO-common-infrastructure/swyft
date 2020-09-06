@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 
 from .core import *
+from .more import DataDictXZ
+from .utils import array_to_tensor
 
 class Data(torch.utils.data.Dataset):
     def __init__(self, xz):
@@ -25,8 +27,8 @@ def gen_train_data(model, nsamples, zdim, mask = None):
     else:
         z = sample_constrained_hypercube(nsamples, zdim, mask)
     
-    xz = simulate(model, z)
-    dataset = Data(xz)
+    x = simulate(model, z)
+    dataset = DataDictXZ(x, z)
     
     return dataset
 
@@ -54,14 +56,14 @@ def trainloop(net, dataset, combinations = None, nbatch = 8, nworkers = 4,
 
 def posteriors(x0, net, dataset, combinations = None, device = 'cpu'):
     x0 = x0.to(device)
-    z = torch.stack(get_z(dataset)).to(device)
+    z = dataset.z.to(device)
     z = torch.stack([combine_z(zs, combinations) for zs in z])
     lnL = get_lnL(net, x0, z)
     return z.cpu(), lnL.cpu()
 
 class SWYFT:
     def __init__(self, x0, model, zdim, head = None, device = 'cpu', max_epochs = 100):
-        self.x0 = torch.tensor(x0).float()
+        self.x0 = array_to_tensor(x0)
         self.model = model
         self.zdim = zdim
         self.head_cls = head  # head network class

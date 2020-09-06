@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .types import Array, Tensor
+from .types import Array, Tensor, ScalarFloat
 from .utils import get_device_if_not_none, array_to_tensor
 
 #######################
@@ -30,12 +30,12 @@ def combine_z(z: Array, combinations: Collection) -> Tensor:
 # Generate sample batches
 #########################
 
-def sample_hypercube(num_samples: int, num_params: int) -> Array:
+def sample_hypercube(num_samples: int, num_params: int) -> Tensor:
     """Return uniform samples from the hyper cube.
 
     Args:
-        num_samples (int): number of samples.
-        num_params (int): dimension of hypercube.
+        num_samples: number of samples.
+        num_params: dimension of hypercube.
 
     Returns:
         Tensor: random samples.
@@ -218,14 +218,20 @@ def train(
 # NOTE: z combinations (with pdim > 1) should not be generated here, but just
 # fed it. They can be generated externally.
 
-def get_lnL(net, x0, z, n_batch = 64):
-    """Return current estimate of normalized marginal 1-dim lnL.
+def get_lnL(
+    log_likelihood_estimator: nn.Module, 
+    x0: Tensor, 
+    z: Tensor, 
+    n_batch: int = 64
+):
+    """Return current estimate of unnormalized marginal 1-dim lnL.
+    The function can only be applied to exactly the parameter combinations that defined the likelihood_estimator.
 
     Args:
-        net (nn.Module): trained ratio estimation net.
-        x0 (torch.tensor): data.
-        z : (nsamples, pnum, pdim)
-        n_batch (int): minibatch size.
+        log_likelihood_estimator: Has predefined possible paramter combinations.
+        x0: Observation.
+        z: Takes the shape (nsamples, pnum, pdim), same as how log_likelihood_estimator was defined.
+        n_batch: minibatch size.
 
     Returns:
         lnL: (nsamples, pnum)
@@ -235,7 +241,7 @@ def get_lnL(net, x0, z, n_batch = 64):
     lnL = []
     for i in range(nsamples//n_batch+1):
         zbatch = z[i*n_batch:(i+1)*n_batch]
-        lnL += net(x0.unsqueeze(0), zbatch).detach().cpu()
+        lnL += log_likelihood_estimator(x0.unsqueeze(0), zbatch).detach().cpu()
 
     return torch.stack(lnL)
 
@@ -334,11 +340,14 @@ class Network(nn.Module):
             x_mean, x_std, z_mean, z_std = get_norms(xz_init)
         else:
             x_mean, x_std, z_mean, z_std = 0., 1., 0., 1.
-        self.x_mean = torch.nn.Parameter(array_to_tensor(x_mean))
-        self.z_mean = torch.nn.Parameter(array_to_tensor(z_mean))
-        self.x_std = torch.nn.Parameter(array_to_tensor(x_std))
-        self.z_std = torch.nn.Parameter(array_to_tensor(z_std))
+        self.x_mean = torch.nn.Parameter(torch.tensor(x_mean))
+        self.z_mean = torch.nn.Parameter(torch.tensor(z_mean))
+        self.x_std = torch.nn.Parameter(torch.tensor(x_std))
+        self.z_std = torch.nn.Parameter(torch.tensor(z_std))
     
+    # TODO This require running
+    # torch.stack([combine_z(zs, combinations) for zs in z])
+    # before using forward. Rethink how this works.
     def forward(self, x, z):
         #TODO : Bring normalization back
         #x = (x-self.x_mean)/self.x_std
@@ -352,70 +361,54 @@ class Network(nn.Module):
         out = self.legs(y, z)
         return out
 
-def iter_sample_z(n_draws, zdim, net, x0, verbosity = False, threshold = 1e-6):
-    """Generate parameter samples z~p_c(z) from constrained prior.
-    
-    Arguments
-    ---------
-    n_draws: Number of draws
-    zdim: Number of dimensions of z
-    net: Trained density network
-    x0: Reference data
-    
-    Returns
-    -------
-    z: list of zdim samples with length n_draws
+def sample_constrained_hypercube(num_samples: int, zdim: int, mask: Callable[[Array,], Tensor]):
+    """Return uniform samples from the hyper cube.
+
+    Args:
+        num_samples: number of samples.
+        zdim: dimension of hypercube.
+
+    Returns:
+        Tensor: random samples.
     """
-    done = False
-    zout = defaultdict(lambda: [])
-    counter = np.zeros(zdim)
-    frac = np.ones(zdim)
-    while not done:
-        z = torch.rand(n_draws, zdim, device=x0.device)
-        zlnL = estimate_lnL(net, x0, z)
-        for i in range(zdim):
-            mask = zlnL[i]['lnL'] > np.log(threshold)
-            frac[i] = np.true_divide(sum(mask), len(mask))
-            zout[i].append(zlnL[i]['z'][mask])
-            counter[i] += mask.sum()
-        done = min(counter) >= n_draws
-    if verbosity:
-        print("Constrained posterior volume:", frac.prod())
-    
-    #out = list(torch.tensor([np.concatenate(zout[i])[:n_draws] for i in range(zdim)]).T[0])
-    out = list(torch.stack([torch.cat(zout[i]).squeeze(-1)[:n_draws] for i in range(zdim)]).T)
-    return out
-
-
-def sample_constrained_hypercube(nsamples, zdim, mask):
     done = False
     zout = defaultdict(lambda: [])
     counter = np.zeros(zdim)  # Counter of accepted points in each z component
     frac = np.ones(zdim)
     while not done:
-        z = torch.rand(nsamples, zdim)
+        z = torch.rand(num_samples, zdim)
         m = mask(z.unsqueeze(-1))
         for i in range(zdim):
             frac[i] = np.true_divide(sum(m[:,i]),len(m))
             zout[i].append(z[m[:,i], i])
             counter[i] += m[:,i].sum()
-        done = min(counter) >= nsamples
+        done = min(counter) >= num_samples
     print("Constrained posterior volume:", frac.prod())
     
-    out = torch.stack([torch.cat(zout[i]).squeeze(-1)[:nsamples] for i in range(zdim)]).T
+    out = torch.stack([torch.cat(zout[i]).squeeze(-1)[:num_samples] for i in range(zdim)]).T
     return out
 
+class Mask(object):
+    def __init__(
+        self, 
+        log_likelihood_estimator: nn.Module, 
+        x0: Array, 
+        threshold: ScalarFloat,
+    ):
+        """Classifies parameters as above or below the likelihood threshold.
+        The mask can only be applied to exactly the parameter combinations that defined the likelihood_estimator.
+        Mask evaluation takes place on the cpu.
 
-# NOTE: This mask works on exactly the parameter combinations that were also
-# used for the definition of the network, not plain z vectors.
-class Mask:
-    def __init__(self, net, x0, threshold):
+        Args:
+            likelihood_estimator: Takes parameters of shape [b, pnum, pdim], returns a log likelihood [b, pnum].
+            x0: Optimized observation.
+            threshold: Mask function returns true when likelihood_estimator(z) > log(treshold) for all pnum.
+        """
+        self.log_likelihood_estimator = deepcopy(log_likelihood_estimator).eval().cpu()
         self.x0 = x0
-        self.net = net
         self.threshold = threshold
-        self.device = x0.device
 
-    def __call__(self, z):
+    def __call__(self, z: Array) -> Tensor:
         """
         Args:
             z : (nsamples, pnum, pdim)
@@ -423,10 +416,16 @@ class Mask:
         Returns:
             mask : (nsamples, pnum)
         """
-        z = z.to(self.device)
-        lnL = get_lnL(self.net, self.x0, z).cpu()
-        lnL -= lnL.max(axis=0)[0]
-        return lnL > np.log(self.threshold)
+        z = array_to_tensor(z)
+        dtype, device = z.dtype, z.device
+        z = z.cpu()
+        x0 = array_to_tensor(self.x0, dtype, device='cpu')
+
+        with torch.no_grad():
+            lnL = get_lnL(self.log_likelihood_estimator, x0, z)
+            lnL -= lnL.max(axis=0)[0]
+            verdict = lnL > np.log(self.threshold)
+            return verdict.to(device)
 
 if __name__ == "__main__":
     pass
