@@ -1,4 +1,5 @@
 # pylint: disable=no-member
+import abc
 from .types import Array, Shape, ScalarFloat, Tensor
 from typing import Optional, Union, Callable, Iterable, Sequence, Tuple
 

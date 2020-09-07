@@ -1,5 +1,5 @@
 # pylint: disable=no-member, not-callable
-from typing import Callable, Collection, Optional
+from typing import Callable, Collection, Optional, Tuple
 from copy import deepcopy
 from contextlib import nullcontext
 from collections import defaultdict
@@ -9,8 +9,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .types import Array, Tensor, ScalarFloat
+from .types import Array, Tensor, ScalarFloat, Device
 from .utils import get_device_if_not_none, array_to_tensor
+from .hook import Hook
 
 #######################
 # Convenience functions
@@ -137,36 +138,39 @@ def loss_fn(network: nn.Module, x: Tensor, z: Tensor, combinations: Optional[Col
 # We have the posterior exactly because our proir is known and flat. Flip bayes theorem, we have the likelihood ratio.
 # Consider that the variance of the loss from different legs causes some losses to have high coefficients in front of them.
 def train(
-    network, 
-    train_loader,
-    validation_loader,
-    early_stopping_patience,
-    max_epochs = None,
-    lr = 1e-3,
-    combinations = None,
-    device=None,
-    non_blocking=True
+    network: nn.Module, 
+    train_loader: torch.utils.data.DataLoader,
+    validation_loader: torch.utils.data.DataLoader,
+    optimizer: torch.optim.Optimizer,
+    max_epochs: Optional[int] = None,
+    combinations: Optional[Collection[Collection[int]]] = None,
+    hooks: Optional[Collection[Hook]] = None,
+    device: Optional[Device] = None,
+    non_blocking: Optional[bool] = True,
 ):
     """Network training loop.
 
     Args:
-        network (nn.Module): network for ratio estimation.
-        train_loader (DataLoader): DataLoader of samples.
-        validation_loader (DataLoader): DataLoader of samples.
-        max_epochs (int): Number of epochs.
-        lr (float): learning rate.
-        combinations (list, optional): determines posteriors that are generated.
+        network: network for ratio estimation.
+        train_loader: DataLoader of samples.
+        validation_loader: DataLoader of samples.
+        optimizer: Takes params and returns optimizer.
+        max_epochs : Number of epochs.
+        combinations: determines posteriors that are generated.
             examples:
                 [[0,1], [3,4]]: p(z_0,z_1) and p(z_3,z_4) are generated
                     initialize network with zdim = 2, pdim = 2
                 [[0,1,5,2]]: p(z_0,z_1,z_5,z_2) is generated
                     initialize network with zdim = 1, pdim = 4
-        device (str, device): Move batches to this device.
-        non_blocking (bool): non_blocking in .to(device) expression.
+        hooks: Hooks like early stopping and scheduled noise. Executed in order.
+        device: Move batches to this device.
+        non_blocking: non_blocking in .to(device) expression.
 
     Returns:
         list: list of training losses.
     """
+    hooks = [] if hooks is None else hooks
+
     # TODO consider that the user might want other training stats, like number of correct samples for example
     def do_epoch(loader: torch.utils.data.dataloader.DataLoader, train: bool):
         accumulated_loss = 0
@@ -174,8 +178,14 @@ def train(
         with training_context:
             for batch in loader:
                 optimizer.zero_grad()
+                
+                for hook in hooks:
+                    batch['x'] = hook.on_x(batch['x'], batch['z'])
+                    batch['z'] = hook.on_z(batch['x'], batch['z'])
+
                 if device is not None:
                     batch = {k: v.to(device, non_blocking=non_blocking) for k, v in batch.items()}
+
                 loss = loss_fn(network, batch['x'], batch['z'], combinations = combinations)
                 if train:
                     loss.backward()
@@ -184,29 +194,43 @@ def train(
         return accumulated_loss
 
     max_epochs =  2 ** 31 - 1 if max_epochs is None else max_epochs
-    optimizer = torch.optim.Adam(network.parameters(), lr = lr)
+    optimizer = optimizer(network.parameters())
+    
+    for hook in hooks:
+        hook.on_optimizer_init(optimizer)
 
     n_train_batches = len(train_loader)
     n_validation_batches = len(validation_loader)
     
     train_losses, validation_losses = [], []
-    epoch, fruitless_epoch, min_loss = 0, 0, float("Inf")
-    while epoch < max_epochs and fruitless_epoch < early_stopping_patience:
+    epoch, min_loss = 0, float("Inf")
+    while epoch < max_epochs:
         network.train()
         train_loss = do_epoch(train_loader, True)
-        train_losses.append(train_loss / n_train_batches)
+        avg_train_loss = train_loss / n_train_batches
+        train_losses.append(avg_train_loss)
         
         network.eval()
         validation_loss = do_epoch(validation_loader, False)
-        validation_losses.append(validation_loss / n_validation_batches)
+        avg_validation_loss = validation_loss / n_validation_batches
+        validation_losses.append(avg_validation_loss)
 
         epoch += 1
-        if epoch == 0 or min_loss > validation_loss:
-            fruitless_epoch = 0
-            min_loss = validation_loss
+        if epoch == 0 or min_loss > avg_validation_loss:
+            min_loss = avg_validation_loss
             best_state_dict = deepcopy(network.state_dict())
-        else:
-            fruitless_epoch += 1
+        
+        for hook in hooks:
+            hook.on_val_loss(avg_validation_loss)
+        
+        for hook in hooks:
+            hook.on_epoch_end()
+
+        if any(hook.stop_training for hook in hooks):
+            break
+    
+    if epoch >= max_epochs:
+        warn(f"Training finished by reaching max_epochs == {max_epochs}.")
 
     return train_losses, validation_losses, best_state_dict
 
@@ -309,9 +333,7 @@ class DenseLegs(nn.Module):
         x = self.fc4(x).squeeze(-1)
         return x
 
-def get_norms(xz):
-    x = get_x(xz)
-    z = get_z(xz)
+def get_norms(x: Array, z: Array) -> Tuple[Array, Array, Array, Array]:
     x_mean = sum(x)/len(x)
     z_mean = sum(z)/len(z)
     x_var = sum([(x[i]-x_mean)**2 for i in range(len(x))])/len(x)
@@ -319,13 +341,12 @@ def get_norms(xz):
     return x_mean, x_var**0.5, z_mean, z_var**0.5
 
 class Network(nn.Module):
-    def __init__(self, xdim, pnum, pdim = 1, xz_init = None, head = None, p = 0.):
+    def __init__(self, xdim, pnum, pdim = 1, head = None, p = 0., datanorms = None):
         """Base network combining z-independent head and parallel tail.
 
         :param xdim: Number of data dimensions going into DenseLeg network
         :param pnum: Number of posteriors to estimate
         :param pdim: Dimensionality of posteriors
-        :param xz_init: xz Samples used for normalization
         :param head: Head network, z-independent
         :type head: `torch.nn.Module`, optional
 
@@ -335,28 +356,29 @@ class Network(nn.Module):
         super().__init__()
         self.head = head
         self.legs = DenseLegs(xdim, pnum, pdim = pdim, p = p)
-        
-        if xz_init is not None:
-            x_mean, x_std, z_mean, z_std = get_norms(xz_init)
-        else:
-            x_mean, x_std, z_mean, z_std = 0., 1., 0., 1.
-        self.x_mean = torch.nn.Parameter(torch.tensor(x_mean))
-        self.z_mean = torch.nn.Parameter(torch.tensor(z_mean))
-        self.x_std = torch.nn.Parameter(torch.tensor(x_std))
-        self.z_std = torch.nn.Parameter(torch.tensor(z_std))
+
+        # Set datascaling
+        if datanorms is None:
+            datanorms = [torch.tensor(0.), torch.tensor(1.), torch.tensor(0.5), torch.tensor(0.5)]
+        self._set_datanorms(*datanorms)
+
+    def _set_datanorms(self, x_mean, x_std, z_mean, z_std):
+        self.x_loc = torch.nn.Parameter(x_mean)
+        self.x_scale = torch.nn.Parameter(x_std)
+        self.z_loc = torch.nn.Parameter(z_mean.unsqueeze(-1))
+        self.z_scale = torch.nn.Parameter(z_std.unsqueeze(-1))
     
     # TODO This require running
     # torch.stack([combine_z(zs, combinations) for zs in z])
     # before using forward. Rethink how this works.
     def forward(self, x, z):
-        #TODO : Bring normalization back
-        #x = (x-self.x_mean)/self.x_std
-        #z = (z-self.z_mean)/self.z_std
+        x = (x-self.x_loc)/self.x_scale
+        z = (z-self.z_loc)/self.z_scale
 
         if self.head is not None:
             y = self.head(x)
         else:
-            y = x  # Take data as features
+            y = x  # Use 1-dim data vector as features
 
         out = self.legs(y, z)
         return out
@@ -373,17 +395,18 @@ def sample_constrained_hypercube(num_samples: int, zdim: int, mask: Callable[[Ar
     """
     done = False
     zout = defaultdict(lambda: [])
-    counter = np.zeros(zdim)  # Counter of accepted points in each z component
-    frac = np.ones(zdim)
+    counter1 = np.zeros(zdim)  # Counter of accepted points in each z component
+    counter2 = np.zeros(zdim)  # Counter of tested points in each z component
     while not done:
         z = torch.rand(num_samples, zdim)
         m = mask(z.unsqueeze(-1))
         for i in range(zdim):
-            frac[i] = np.true_divide(sum(m[:,i]),len(m))
             zout[i].append(z[m[:,i], i])
-            counter[i] += m[:,i].sum()
-        done = min(counter) >= num_samples
-    print("Constrained posterior volume:", frac.prod())
+            counter1[i] += m[:,i].sum()
+            counter2[i] += num_samples
+        done = min(counter1) >= num_samples
+    post_vol = np.true_divide(counter1, counter2)  # constrained posterior volume
+    print("Constrained posterior volume:", post_vol.prod())
     
     out = torch.stack([torch.cat(zout[i]).squeeze(-1)[:num_samples] for i in range(zdim)]).T
     return out
