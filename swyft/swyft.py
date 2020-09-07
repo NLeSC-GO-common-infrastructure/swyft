@@ -2,6 +2,7 @@
 from copy import deepcopy
 from functools import partial
 from typing import Union
+from warnings import warn
 
 import numpy as np
 from scipy.integrate import trapz
@@ -58,7 +59,6 @@ def gen_train_data(model, nsamples, zdim, mask = None):
 def trainloop(
     net, 
     dataset: torch.utils.data.Dataset, 
-    combinations = None, 
     batch_size: int = 8, 
     max_epochs: int = 100, 
     lr: float = 1e-3,
@@ -94,16 +94,15 @@ def trainloop(
             valid_loader,
             optimizer,
             max_epochs=max_epochs, 
-            combinations=combinations,
             hooks=hooks,
             device=device, 
         )
     net.load_state_dict(best_state_dict)
 
-def posteriors(x0, net, dataset, combinations = None, device = 'cpu'):
+# TODO pretty sure this function is redundant
+def posteriors(x0, net, dataset, device = 'cpu'):
     x0 = x0.to(device)
     z = dataset.z.to(device)
-    z = torch.stack([combine_z(zs, combinations) for zs in z])
     lnL = get_lnL(net, x0, z)
     return z.cpu(), lnL.cpu()
 
@@ -129,19 +128,19 @@ class SWYFT:
         self.postNd_store = []
         self.netNd_store = []
 
-    def _get_net(self, pnum, pdim, head = None, datanorms = None):
+    def _get_net(self, combinations, head = None, datanorms = None):
         # Initialize neural network
         if self.head_cls is None and head is None:
             head = None
-            xdim = len(self.x0)
+            ydim = len(self.x0)
         elif head is not None:
-            xdim = head(self.x0.unsqueeze(0).to(self.device)).shape[1]
-            print("Number of output features:", xdim)
+            ydim = head(self.x0.unsqueeze(0).to(self.device)).shape[1]
+            print("Number of output features:", ydim)
         else:
             head = self.head_cls()
-            xdim = head(self.x0.unsqueeze(0)).shape[1]
-            print("Number of output features:", xdim)
-        net = Network(xdim = xdim, pnum = pnum, pdim = pdim, head = head, datanorms = datanorms).to(self.device)
+            ydim = head(self.x0.unsqueeze(0)).shape[1]
+            print("Number of output features:", ydim)
+        net = Network(ydim=ydim, combinations=combinations, head=head, datanorms = datanorms).to(self.device)
         return net
 
     def append_dataset(self, dataset):
@@ -160,7 +159,7 @@ class SWYFT:
         if len(self.net1d_store) > 0 and recycle_net:
             net = deepcopy(self.net1d_store[-1])
         else:
-            net = self._get_net(self.zdim, 1, datanorms = datanorms)
+            net = self._get_net(range_of_lists(self.zdim), datanorms = datanorms)
 
         # Train
         trainloop(
@@ -197,7 +196,7 @@ class SWYFT:
         """Iteratively generating training data and train 1-dim posteriors."""
         for _ in range(nrounds):
             if self.model is None:
-                print("WARNING: No model provided. Skipping data generation.")
+                warn("No model provided. Skipping data generation.")
             else:
                 self.data(nsamples = nsamples, threshold = threshold)
             self.train1d(recycle_net = recycle_net, max_epochs = max_epochs, nbatch = nbatch)
@@ -208,28 +207,28 @@ class SWYFT:
         dataset = self.data_store[-1]
 
         # Generate network
-        pnum = len(combinations)
-        pdim = len(combinations[0])
-
         if recycle_net:
             head = deepcopy(self.net1d_store[-1].head)
-            net = self._get_net(pnum, pdim, head = head)
+            net = self._get_net(combinations, head = head)
         else:
-            net = self._get_net(pnum, pdim)
+            net = self._get_net(combinations)
 
         # Train!
         trainloop(
             net, 
             dataset, 
-            combinations = combinations, 
             device = self.device, 
             max_epochs = max_epochs, 
             batch_size = nbatch,
         )
 
         # Get posteriors and store them internally
-        zgrid, lnLgrid = posteriors(self.x0, net, dataset, combinations =
-                combinations, device = self.device)
+        zgrid, lnLgrid = posteriors(
+            self.x0, 
+            net, 
+            dataset, 
+            device=self.device
+        )
 
         self.postNd_store.append((combinations, zgrid, lnLgrid))
         self.netNd_store.append(net)
@@ -243,18 +242,18 @@ class SWYFT:
         if isinstance(indices, int):
             i = indices
             # Sort for convenience
-            x = self.post1d_store[version][0][:,i,0]
-            y = self.post1d_store[version][1][:,i]
-            isorted = np.argsort(x)
-            x, y = x[isorted], y[isorted]
-            y = np.exp(y)
-            I = trapz(y, x)
-            return x, y/I
+            z = self.post1d_store[version][0][:,i]
+            x = self.post1d_store[version][1][:,i]
+            isorted = np.argsort(z)
+            z, x = z[isorted], x[isorted]
+            x = np.exp(x)
+            I = trapz(x, z)
+            return z, x/I
         else:
             for i in range(len(self.postNd_store)-1, -1, -1):
                 combinations = self.postNd_store[i][0]
                 if indices in combinations:
                     j = combinations.index(indices)
                     return self.postNd_store[i][1][:,j], self.postNd_store[i][2][:,j]
-            print("WARNING: Did not find requested parameter combination.")
+            warn("Did not find requested parameter combination.")
             return None

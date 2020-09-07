@@ -1,5 +1,5 @@
 # pylint: disable=no-member, not-callable
-from typing import Callable, Collection, Optional, Tuple
+from typing import Callable, Collection, Optional, Tuple, List
 from copy import deepcopy
 from contextlib import nullcontext
 from collections import defaultdict
@@ -17,15 +17,23 @@ from .hook import Hook
 # Convenience functions
 #######################
 
-def combine_z(z: Array, combinations: Collection) -> Tensor:
-    """Generate parameter combinations in last dimension. 
-    Requires: z.ndim == 1. 
-    output.shape == (n_posteriors, parameter shape)
+def combine_z(z: Tensor, combinations: Optional[List]) -> Tensor:
+    """Generate parameter combinations in last dimension using fancy indexing.
+    
+    Args:
+        z: Parameters of shape [..., Z]
+        combinations: List of parameter combinations.
+    
+    Returns:
+        output = z[..., combinations]. When combinations is None, unsqueeze last dim.
     """
     if combinations is None:
         return z.unsqueeze(-1)
     else:
-        return torch.stack([z[c] for c in combinations])
+        return z[..., combinations]
+
+def range_of_lists(stop):
+    return [[item] for item in range(stop)]
 
 #########################
 # Generate sample batches
@@ -80,19 +88,13 @@ def simulate(model: Callable[[Array], Array], z: Tensor) -> Tensor:
 # Training
 ##########
 
-def loss_fn(network: nn.Module, x: Tensor, z: Tensor, combinations: Optional[Collection] = None):
+def loss_fn(network: nn.Module, x: Tensor, z: Tensor):
     """Evaluate binary-cross-entropy loss function. Mean over batch.
 
     Args:
         network: network taking minibatch of samples and returing ratio estimator.
         x: samples x~p(x|z)
         z: samples z~p(z).
-        combinations: determines posteriors that are generated.
-            examples:
-                [[0,1], [3,4]]: p(z_0,z_1) and p(z_3,z_4) are generated
-                    initialize network with zdim = 2, pdim = 2
-                [[0,1,5,2]]: p(z_0,z_1,z_5,z_2) is generated
-                    initialize network with zdim = 1, pdim = 4
 
     Returns:
         training loss.
@@ -111,15 +113,13 @@ def loss_fn(network: nn.Module, x: Tensor, z: Tensor, combinations: Optional[Col
     # bring z into shape
     # (n_batch*2, param-shape)  - repeat twice each sample of z - there are n_batch samples
     # repetition is alternating in first dimension: [a, b, a, b, c, d, c, d, ...]
-    z = torch.stack([combine_z(zs, combinations) for zs in z])
-    zdim = z.size(1)
     z = z.view(n_batch // 2, -1, *z.shape[-1:])
     z = torch.repeat_interleave(z, 2, dim = 0)
-    z = z.view(n_batch*2, -1, *z.shape[-1:])
+    z = z.view(n_batch*2, *z.shape[-1:])
     
     # call network
     lnL = network(x, z)
-    lnL = lnL.view(n_batch // 2, 4, zdim)
+    lnL = lnL.view(n_batch // 2, 4, -1)
 
     # Evaluate cross-entropy loss
     # loss = 
@@ -143,7 +143,6 @@ def train(
     validation_loader: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
     max_epochs: Optional[int] = None,
-    combinations: Optional[Collection[Collection[int]]] = None,
     hooks: Optional[Collection[Hook]] = None,
     device: Optional[Device] = None,
     non_blocking: Optional[bool] = True,
@@ -156,12 +155,6 @@ def train(
         validation_loader: DataLoader of samples.
         optimizer: Takes params and returns optimizer.
         max_epochs : Number of epochs.
-        combinations: determines posteriors that are generated.
-            examples:
-                [[0,1], [3,4]]: p(z_0,z_1) and p(z_3,z_4) are generated
-                    initialize network with zdim = 2, pdim = 2
-                [[0,1,5,2]]: p(z_0,z_1,z_5,z_2) is generated
-                    initialize network with zdim = 1, pdim = 4
         hooks: Hooks like early stopping and scheduled noise. Executed in order.
         device: Move batches to this device.
         non_blocking: non_blocking in .to(device) expression.
@@ -186,7 +179,7 @@ def train(
                 if device is not None:
                     batch = {k: v.to(device, non_blocking=non_blocking) for k, v in batch.items()}
 
-                loss = loss_fn(network, batch['x'], batch['z'], combinations = combinations)
+                loss = loss_fn(network, batch['x'], batch['z'])
                 if train:
                     loss.backward()
                     optimizer.step()
@@ -295,28 +288,28 @@ class LinearWithChannel(nn.Module):
     def forward(self, x):
         x = x.unsqueeze(-1)
         return torch.matmul(self.w, x).squeeze(-1) + self.b
-    
-def combine(x, z):
+
+def concatenate_data_and_parameters(x: Tensor, z: Tensor):
     """Combines data vectors x and parameter vectors z.
     
-    z : (..., pnum, pdim)
+    z : (..., n_posteriors, dim_posteriors)
     x : (..., xdim)
     
-    returns: (..., pnum, xdim + pdim)
+    returns: (..., n_posteriors, xdim + dim_posteriors)
     
     """
     x = x.unsqueeze(-2) # (..., 1, xdim)
-    x = x.expand(*z.shape[:-1], *x.shape[-1:]) # (..., pnum, xdim)
+    x = x.expand(*z.shape[:-1], *x.shape[-1:]) # (..., n_posteriors, xdim)
     return torch.cat([x, z], -1)
 
 class DenseLegs(nn.Module):
-    def __init__(self, xdim, pnum, pdim = 1, p = 0.0, NH = 256):
+    def __init__(self, ydim, pnum, pdim = 1, dropout_percent = 0.0, NH = 256):
         super().__init__()
-        self.fc1 = LinearWithChannel(xdim+pdim, NH, pnum)
+        self.fc1 = LinearWithChannel(ydim+pdim, NH, pnum)
         self.fc2 = LinearWithChannel(NH, NH, pnum)
         self.fc3 = LinearWithChannel(NH, NH, pnum)
         self.fc4 = LinearWithChannel(NH, 1, pnum)
-        self.drop = nn.Dropout(p = p)
+        self.drop = nn.Dropout(p = dropout_percent)
 
         self.af = torch.relu
 
@@ -324,7 +317,7 @@ class DenseLegs(nn.Module):
         self.af2 = lambda x: x*torch.sigmoid(x)
 
     def forward(self, x, z):
-        x = combine(x, z)
+        x = concatenate_data_and_parameters(x, z)
         x = self.af(self.fc1(x))
         x = self.drop(x)
         x = self.af(self.fc2(x))
@@ -340,22 +333,40 @@ def get_norms(x: Array, z: Array) -> Tuple[Array, Array, Array, Array]:
     z_var = sum([(z[i]-z_mean)**2 for i in range(len(z))])/len(z)
     return x_mean, x_var**0.5, z_mean, z_var**0.5
 
+# TODO: make paramters register_buffers so that we can save them.
 class Network(nn.Module):
-    def __init__(self, xdim, pnum, pdim = 1, head = None, p = 0., datanorms = None):
+    def __init__(
+        self, 
+        ydim: int, 
+        combinations: List,
+        head = None, 
+        dropout_percent = 0., 
+        datanorms = None
+    ):
         """Base network combining z-independent head and parallel tail.
 
-        :param xdim: Number of data dimensions going into DenseLeg network
-        :param pnum: Number of posteriors to estimate
-        :param pdim: Dimensionality of posteriors
-        :param head: Head network, z-independent
-        :type head: `torch.nn.Module`, optional
+        Args:
+            ydim: Number of data dimensions going into DenseLeg network
+            combinations: List of lists of indicies to form z input to DenseLeg
+                examples:
+                [[0,1], [3,4]]: p(z_0,z_1) and p(z_3,z_4) are generated
+                    initialize network with zdim = 2, pdim = 2
+                [[0,1,5,2]]: p(z_0,z_1,z_5,z_2) is generated
+                    initialize network with zdim = 1, pdim = 4
+            head: Head network, z-independent
+            dropout_percent: Percent to drop out on .train()
+            datanorms: 
 
         The forward method of the `head` network takes data `x` as input, and
         returns intermediate state `y`.
         """
         super().__init__()
         self.head = head
-        self.legs = DenseLegs(xdim, pnum, pdim = pdim, p = p)
+        assert all([len(combinations[0]) == len(combo) for combo in combinations])
+        pnum = len(combinations)
+        pdim = len(combinations[0])
+        self.combinations = combinations
+        self.legs = DenseLegs(ydim, pnum, pdim = pdim, dropout_percent = dropout_percent)
 
         # Set datascaling
         if datanorms is None:
@@ -365,15 +376,14 @@ class Network(nn.Module):
     def _set_datanorms(self, x_mean, x_std, z_mean, z_std):
         self.x_loc = torch.nn.Parameter(x_mean)
         self.x_scale = torch.nn.Parameter(x_std)
-        self.z_loc = torch.nn.Parameter(z_mean.unsqueeze(-1))
-        self.z_scale = torch.nn.Parameter(z_std.unsqueeze(-1))
+        self.z_loc = torch.nn.Parameter(z_mean)
+        self.z_scale = torch.nn.Parameter(z_std)
     
-    # TODO This require running
-    # torch.stack([combine_z(zs, combinations) for zs in z])
-    # before using forward. Rethink how this works.
     def forward(self, x, z):
         x = (x-self.x_loc)/self.x_scale
         z = (z-self.z_loc)/self.z_scale
+
+        z = combine_z(z, self.combinations)
 
         if self.head is not None:
             y = self.head(x)
@@ -399,7 +409,7 @@ def sample_constrained_hypercube(num_samples: int, zdim: int, mask: Callable[[Ar
     counter2 = np.zeros(zdim)  # Counter of tested points in each z component
     while not done:
         z = torch.rand(num_samples, zdim)
-        m = mask(z.unsqueeze(-1))
+        m = mask(z)
         for i in range(zdim):
             zout[i].append(z[m[:,i], i])
             counter1[i] += m[:,i].sum()
