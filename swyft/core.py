@@ -247,11 +247,11 @@ def get_lnL(
     Args:
         log_likelihood_estimator: Has predefined possible paramter combinations.
         x0: Observation.
-        z: Takes the shape (nsamples, pnum, pdim), same as how log_likelihood_estimator was defined.
+        z: Takes the shape (nsamples, zdim), same as how log_likelihood_estimator was defined.
         n_batch: minibatch size.
 
     Returns:
-        lnL: (nsamples, pnum)
+        lnL: (nsamples, n_posteriors)
     """
     nsamples = len(z)
 
@@ -292,10 +292,10 @@ class LinearWithChannel(nn.Module):
 def concatenate_data_and_parameters(x: Tensor, z: Tensor):
     """Combines data vectors x and parameter vectors z.
     
-    z : (..., n_posteriors, dim_posteriors)
+    z : (..., n_posteriors, pdim)
     x : (..., xdim)
     
-    returns: (..., n_posteriors, xdim + dim_posteriors)
+    returns: (..., n_posteriors, xdim + pdim)
     
     """
     x = x.unsqueeze(-2) # (..., 1, xdim)
@@ -303,12 +303,12 @@ def concatenate_data_and_parameters(x: Tensor, z: Tensor):
     return torch.cat([x, z], -1)
 
 class DenseLegs(nn.Module):
-    def __init__(self, ydim, pnum, pdim = 1, dropout_percent = 0.0, NH = 256):
+    def __init__(self, ydim, n_posteriors, pdim = 1, dropout_percent = 0.0, NH = 256):
         super().__init__()
-        self.fc1 = LinearWithChannel(ydim+pdim, NH, pnum)
-        self.fc2 = LinearWithChannel(NH, NH, pnum)
-        self.fc3 = LinearWithChannel(NH, NH, pnum)
-        self.fc4 = LinearWithChannel(NH, 1, pnum)
+        self.fc1 = LinearWithChannel(ydim+pdim, NH, n_posteriors)
+        self.fc2 = LinearWithChannel(NH, NH, n_posteriors)
+        self.fc3 = LinearWithChannel(NH, NH, n_posteriors)
+        self.fc4 = LinearWithChannel(NH, 1, n_posteriors)
         self.drop = nn.Dropout(p = dropout_percent)
 
         self.af = torch.relu
@@ -363,10 +363,10 @@ class Network(nn.Module):
         super().__init__()
         self.head = head
         assert all([len(combinations[0]) == len(combo) for combo in combinations])
-        pnum = len(combinations)
+        n_posteriors = len(combinations)
         pdim = len(combinations[0])
         self.combinations = combinations
-        self.legs = DenseLegs(ydim, pnum, pdim = pdim, dropout_percent = dropout_percent)
+        self.legs = DenseLegs(ydim, n_posteriors, pdim = pdim, dropout_percent = dropout_percent)
 
         # Set datascaling
         if datanorms is None:
@@ -433,9 +433,9 @@ class Mask(object):
         Mask evaluation takes place on the cpu.
 
         Args:
-            likelihood_estimator: Takes parameters of shape [b, pnum, pdim], returns a log likelihood [b, pnum].
+            likelihood_estimator: Takes parameters of shape [b, zdim], returns a log likelihood [b, n_posteriors].
             x0: Optimized observation.
-            threshold: Mask function returns true when likelihood_estimator(z) > log(treshold) for all pnum.
+            threshold: Mask function returns true when likelihood_estimator(z) > log(treshold) for all posteriors.
         """
         self.log_likelihood_estimator = deepcopy(log_likelihood_estimator).eval().cpu()
         self.x0 = x0
@@ -444,10 +444,10 @@ class Mask(object):
     def __call__(self, z: Array) -> Tensor:
         """
         Args:
-            z : (nsamples, pnum, pdim)
+            z : (b, zdim)
 
         Returns:
-            mask : (nsamples, pnum)
+            mask : (b, n_posteriors)
         """
         z = array_to_tensor(z)
         dtype, device = z.dtype, z.device

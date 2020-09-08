@@ -99,11 +99,15 @@ def trainloop(
         )
     net.load_state_dict(best_state_dict)
 
-# TODO pretty sure this function is redundant
-def posteriors(x0, net, dataset, device = 'cpu'):
+def get_posterior_per_leg(x0, net, dataset, device = 'cpu'):
+    """The function returns parameters as seen by the network and lnL as estimated by the network."""
     x0 = x0.to(device)
     z = dataset.z.to(device)
+    net = net.to(device)
     lnL = get_lnL(net, x0, z)
+
+    # Save the zs are they are fed into the legs network
+    z = combine_z(z, net.combinations)
     return z.cpu(), lnL.cpu()
 
 class SWYFT:
@@ -171,7 +175,7 @@ class SWYFT:
         )
 
         # Get 1-dim posteriors
-        zgrid, lnLgrid = posteriors(self.x0, net, dataset, device = self.device)
+        zgrid, lnLgrid = get_posterior_per_leg(self.x0, net, dataset, device = self.device)
 
         # Store results
         self.net1d_store.append(net)
@@ -223,7 +227,7 @@ class SWYFT:
         )
 
         # Get posteriors and store them internally
-        zgrid, lnLgrid = posteriors(
+        zgrid, lnLgrid = get_posterior_per_leg(
             self.x0, 
             net, 
             dataset, 
@@ -242,18 +246,18 @@ class SWYFT:
         if isinstance(indices, int):
             i = indices
             # Sort for convenience
-            z = self.post1d_store[version][0][:,i]
-            x = self.post1d_store[version][1][:,i]
+            z = self.post1d_store[version][0][:, i, 0]
+            x = self.post1d_store[version][1][:, i]
             isorted = np.argsort(z)
             z, x = z[isorted], x[isorted]
             x = np.exp(x)
             I = trapz(x, z)
             return z, x/I
         else:
-            for i in range(len(self.postNd_store)-1, -1, -1):
+            for i in reversed(range(len(self.postNd_store))):
                 combinations = self.postNd_store[i][0]
                 if indices in combinations:
                     j = combinations.index(indices)
-                    return self.postNd_store[i][1][:,j], self.postNd_store[i][2][:,j]
+                    return self.postNd_store[i][1][:, j], self.postNd_store[i][2][:, j]
             warn("Did not find requested parameter combination.")
             return None
