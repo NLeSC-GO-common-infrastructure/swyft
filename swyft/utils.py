@@ -27,18 +27,19 @@ def get_device_if_not_none(device: Optional[Device], tensor: Tensor) -> Device:
 
 def array_to_tensor(array: Array, dtype: Optional[torch.dtype] = None, device: Optional[Device] = None) -> Tensor:
     """Converts np.ndarray and torch.Tensor to torch.Tensor with dtype and on device. 
-    Unsafe casts float np.ndarray to torch.get_default_dtype() when dtype == None and torch_default_dtype is a float.
+    When dtype is None, unsafe casts all float-type arrays to torch.get_default_dtype()
     """
     torch_float_types = [torch.half, torch.bfloat16, torch.float, torch.double]
     
     input_dtype = array.dtype
     if isinstance(input_dtype, np.dtype):
         # When the ndarray type is any float send to the torch default (when torch default is a float).
-        if dtype is None:
-            if input_dtype == np.float and torch.get_default_dtype() in torch_float_types:
-                dtype = torch.get_default_dtype()
+        if dtype is None and input_dtype == np.float and torch.get_default_dtype() in torch_float_types:
+            dtype = torch.get_default_dtype()
         return torch.from_numpy(array).to(dtype=dtype, device=device)
     elif isinstance(input_dtype, torch.dtype):
+        if dtype is None and dtype in torch_float_types and torch.get_default_dtype() in torch_float_types:
+            dtype = torch.get_default_dtype()
         return array.to(dtype=dtype, device=device)
     else:
         raise TypeError(f"{input_dtype} was neither numpy.dtype or torch.dtype.")

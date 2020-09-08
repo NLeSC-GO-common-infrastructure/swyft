@@ -198,6 +198,7 @@ def train(
     train_losses, validation_losses = [], []
     epoch, min_loss = 0, float("Inf")
     while epoch < max_epochs:
+        print("Epoch:", epoch, validation_losses)
         network.train()
         train_loss = do_epoch(train_loader, True)
         avg_train_loss = train_loss / n_train_batches
@@ -326,11 +327,21 @@ class DenseLegs(nn.Module):
         x = self.fc4(x).squeeze(-1)
         return x
 
-def get_norms(x: Array, z: Array) -> Tuple[Array, Array, Array, Array]:
+def get_norms(
+    x: Array, 
+    z: Array,
+) -> Tuple[Array, Array, Array, Array]:
     x_mean = sum(x)/len(x)
     z_mean = sum(z)/len(z)
     x_var = sum([(x[i]-x_mean)**2 for i in range(len(x))])/len(x)
     z_var = sum([(z[i]-z_mean)**2 for i in range(len(z))])/len(z)
+
+    print("Normalizations")
+    print("x_mean", x_mean)
+    print("x_err", x_var**0.5)
+    print("z_mean", z_mean)
+    print("z_err", z_var**0.5)
+
     return x_mean, x_var**0.5, z_mean, z_var**0.5
 
 # TODO: make paramters register_buffers so that we can save them.

@@ -51,7 +51,7 @@ def gen_train_data(model, nsamples, zdim, mask = None):
     else:
         z = sample_constrained_hypercube(nsamples, zdim, mask)
     
-    x = simulate(model, z)
+    x = array_to_tensor(simulate(model, z), dtype=z.dtype)
     dataset = DataDictXZ(x, z)
     
     return dataset
@@ -152,7 +152,13 @@ class SWYFT:
         self.data_store.append(dataset)
         self.mask_store.append(None)
 
-    def train1d(self, recycle_net = True, max_epochs = 100, nbatch = 8): 
+    def train1d(
+        self, 
+        recycle_net = True, 
+        max_epochs = 100, 
+        nbatch = 8, 
+        early_stopping_patience = 20
+    ) -> None: 
         """Train 1-dim posteriors."""
         # Use most recent dataset by default
         dataset = self.data_store[-1]
@@ -171,7 +177,8 @@ class SWYFT:
             dataset, 
             device = self.device, 
             max_epochs = max_epochs, 
-            batch_size = nbatch
+            batch_size = nbatch,
+            early_stopping_patience = early_stopping_patience
         )
 
         # Get 1-dim posteriors
@@ -196,26 +203,48 @@ class SWYFT:
         self.mask_store.append(mask)
         self.data_store.append(dataset)
 
-    def run(self, nrounds = 1, nsamples = 3000, threshold = 1e-6, max_epochs = 100, recycle_net = True, nbatch = 8):
+    def run(
+        self, 
+        nrounds = 1, 
+        nsamples = 3000, 
+        threshold = 1e-6, 
+        max_epochs = 100, 
+        recycle_net = True, 
+        nbatch = 8,
+        early_stopping_patience = 20
+    ):
         """Iteratively generating training data and train 1-dim posteriors."""
         for _ in range(nrounds):
             if self.model is None:
                 warn("No model provided. Skipping data generation.")
             else:
                 self.data(nsamples = nsamples, threshold = threshold)
-            self.train1d(recycle_net = recycle_net, max_epochs = max_epochs, nbatch = nbatch)
+            self.train1d(
+                recycle_net = recycle_net, 
+                max_epochs = max_epochs,
+                nbatch = nbatch, 
+                early_stopping_patience = early_stopping_patience
+            )
 
-    def comb(self, combinations, max_epochs = 100, recycle_net = True, nbatch = 8):
+    def comb(
+        self, 
+        combinations, 
+        max_epochs = 100, 
+        recycle_net = True, 
+        nbatch = 8, 
+        early_stopping_patience = 20
+    ):
         """Generate N-dim posteriors."""
         # Use by default data from last 1-dim round
         dataset = self.data_store[-1]
+        datanorms = get_norms(dataset.x, dataset.z)
 
         # Generate network
         if recycle_net:
             head = deepcopy(self.net1d_store[-1].head)
-            net = self._get_net(combinations, head = head)
+            net = self._get_net(combinations, head=head, datanorms=datanorms)
         else:
-            net = self._get_net(combinations)
+            net = self._get_net(combinations, datanorms=datanorms)
 
         # Train!
         trainloop(
@@ -224,6 +253,7 @@ class SWYFT:
             device = self.device, 
             max_epochs = max_epochs, 
             batch_size = nbatch,
+            early_stopping_patience = early_stopping_patience,
         )
 
         # Get posteriors and store them internally
