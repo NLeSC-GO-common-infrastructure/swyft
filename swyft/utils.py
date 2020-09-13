@@ -7,6 +7,7 @@ import torch
 
 from .types import Device, Tensor, Array
 
+
 def set_device(gpu: bool = False) -> Device:
     """Sets the default tensor device."""
     if gpu and torch.cuda.is_available():
@@ -21,9 +22,11 @@ def set_device(gpu: bool = False) -> Device:
         torch.set_default_tensor_type("torch.FloatTensor")
     return device
 
+
 def get_device_if_not_none(device: Optional[Device], tensor: Tensor) -> Device:
     """Returns device if not None, else returns tensor.device."""
     return tensor.device if device is None else device
+
 
 def array_to_tensor(array: Array, dtype: Optional[torch.dtype] = None, device: Optional[Device] = None) -> Tensor:
     """Converts np.ndarray and torch.Tensor to torch.Tensor with dtype and on device. 
@@ -43,3 +46,7 @@ def array_to_tensor(array: Array, dtype: Optional[torch.dtype] = None, device: O
         return array.to(dtype=dtype, device=device)
     else:
         raise TypeError(f"{input_dtype} was neither numpy.dtype or torch.dtype.")
+
+
+if __name__ == "__main__":
+    pass

@@ -6,11 +6,12 @@ from functools import partial
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.distributions.uniform import Uniform
 from torch.utils.data import Dataset, DataLoader
+from torch.distributions.distribution import Distribution
 
 from .core import Mask, sample_hypercube, sample_constrained_hypercube, simulate
 from .types import Array, Shape, ScalarFloat, Tensor
+
 
 class Round(object):
     # The idea is to store everything in lists which are identified by rounds and the associated estimators (or model params)
@@ -120,6 +121,8 @@ class DataDictXZ(torch.utils.data.Dataset):
 class DataCache(object):
     def __init__(
         self,
+        current_round: int,
+        prior: Distribution,
         x: Optional[Array] = None, 
         z: Optional[Array] = None, 
         rounds: Optional[Array] = None, 
@@ -128,12 +131,16 @@ class DataCache(object):
         """Data storeage for a given round.
 
         Args:
+            current_round: label for which round this data comes from.
+            prior: p(z), pytorch prior which implements .pdf, .logpdf, and .sample
             x: samples x~p(x|z).
             z: samples z~p(z).
             rounds: array of ints identifying the round the sample was first drawn in.
             model: function implementing x = model(z).
         """
         super().__init__()
+        self.round = current_round
+        self.prior = prior
         self.x = x
         self.z = z
         self.rounds = rounds
@@ -156,96 +163,6 @@ class DataCache(object):
 
         generator = torch.Generator() if seed is None else torch.Generator().manual_seed(seed)
         return torch.utils.data.random_split(dataset, subset_lengths, generator=generator)
-
-
-def apply_mask_to_xzrounds(
-    masking_fn: Callable[[Array,], Tensor], 
-    x: Array,
-    z: Array, 
-    rounds: Optional[Array] = None
-) -> Tuple[Array, Array, Optional[Array]]:
-    keep_inds = masking_fn(z)
-    x = x[keep_inds]
-    z = z[keep_inds]
-    if rounds is None:
-        return x, z, None
-    else:
-        rounds = rounds[keep_inds]
-        return x, z, rounds
-
-
-# TODO this was before christoph clarified the algorithm to me
-# currying and partial evaluation would make this much more elegant, there must be a way...
-def reuse_and_sample_from_uniform_and_simulate(
-    masking_fn: Callable[[Array,], Tensor],
-    x: Tensor, 
-    z: Tensor, 
-    rounds: Tensor,
-    target_dist_sampler: Callable[[int, int], Tensor],
-    num_samples: int, 
-    zdim: int,
-    model: Callable[[Array], Array], 
-    current_round: int,
-):
-    """Reuse samples which were drawn uniformly before, which lie in the support, then sample more."""
-    x, z, rounds = apply_mask_to_xzrounds(masking_fn, x, z, rounds)
-    assert z.shape[1] == zdim
-    num_drawn = x.shape[0]
-    ordering = torch.randperm(num_drawn)
-    x, z, rounds = x[ordering], z[ordering], rounds[ordering]
-    
-    x, z, rounds = x[:num_samples], z[:num_samples], rounds[:num_samples]
-    num_samples -= num_drawn
-
-    if num_samples <= 0:
-        x, z, rounds
-    else:
-        z_new = target_dist_sampler(num_samples, zdim)
-        x_new = simulate(model, z_new)
-        rounds_new = current_round * torch.ones(num_samples, dtype=rounds.dtype, device=rounds.device)
-    x = torch.cat([x, x_new])
-    z = torch.cat([z, z_new])
-    rounds = torch.cat([rounds, rounds_new])
-    return x, z, rounds
-
-
-def create_constrained_prior(
-    masking_fn: Callable[[Tensor,], Tensor],
-    zdim: int,
-    lower_bound: Tensor = torch.tensor(0.0),
-    upper_bound: Tensor = torch.tensor(1.0),
-    size_eval_grid: int = 10000,  # TODO you could make this non-hypercubic
-):
-    """Yields pytorch uniform prior with zdim.
-    
-    Args:
-        masking_fn: Takes in z and returns shape [N, zdim, 1].
-    """
-    assert lower_bound.ndim == 1 or lower_bound.ndim == 0, f"lower_bound.ndim == {lower_bound.ndim}"
-    assert upper_bound.ndim == 1 or upper_bound.ndim == 0, f"upper_bound.ndim == {upper_bound.ndim}"
-    assert lower_bound.shape == upper_bound.shape
-
-    if lower_bound.shape == () or lower_bound.shape[0] == 1:
-        lower_bound = lower_bound.expand(zdim)
-        upper_bound = upper_bound.expand(zdim)
-    assert lower_bound.shape[0] == zdim, f"lower_bound.shape == {lower_bound.shape}"
-    assert upper_bound.shape[0] == zdim, f"upper_bound.shape == {upper_bound.shape}"
-
-    zgrid = torch.stack(
-        [torch.linspace(low, high, size_eval_grid) for low, high in zip(lower_bound, upper_bound)],
-        dim=-1
-    )
-    keep = masking_fn(zgrid)
-    lower_bounds = []
-    upper_bounds = []
-    for i in range(zdim):
-        bounds = zgrid[:, i][keep[:, i]]
-        lower_bounds.append(bounds[0])
-        upper_bounds.append(bounds[-1])
-    lower_bounds = torch.stack(lower_bounds)
-    upper_bounds = torch.stack(upper_bounds)
-
-    return Uniform(lower_bounds, upper_bounds)
 
 
 if __name__ == "__main__":
