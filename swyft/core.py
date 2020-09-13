@@ -1,5 +1,6 @@
 # pylint: disable=no-member, not-callable
 from typing import Callable, Collection, Optional, Tuple, List
+from functools import partial
 from copy import deepcopy
 from contextlib import nullcontext
 from collections import defaultdict
@@ -236,11 +237,12 @@ def train(
 # NOTE: z combinations (with pdim > 1) should not be generated here, but just
 # fed it. They can be generated externally.
 
+# TODO make this work on arrays
 def get_lnL(
     log_likelihood_estimator: nn.Module, 
     x0: Tensor, 
     z: Tensor, 
-    n_batch: int = 64
+    batch_size: int = 64
 ):
     """Return current estimate of unnormalized marginal 1-dim lnL.
     The function can only be applied to exactly the parameter combinations that defined the likelihood_estimator.
@@ -249,19 +251,36 @@ def get_lnL(
         log_likelihood_estimator: Has predefined possible paramter combinations.
         x0: Observation.
         z: Takes the shape (nsamples, zdim), same as how log_likelihood_estimator was defined.
-        n_batch: minibatch size.
+        batch_size: minibatch size.
 
     Returns:
         lnL: (nsamples, n_posteriors)
     """
     nsamples = len(z)
+    nbatches = nsamples//batch_size
+    
+    if nbatches == 0:
+        return log_likelihood_estimator(x0, z).detach().cpu()
+    else:
+        lnL = []
+        for i in range(nbatches + 1):
+            zbatch = z[i*batch_size:(i+1)*batch_size]
+            lnL += log_likelihood_estimator(x0.unsqueeze(0), zbatch).detach().cpu()
+        return torch.stack(lnL)
 
-    lnL = []
-    for i in range(nsamples//n_batch+1):
-        zbatch = z[i*n_batch:(i+1)*n_batch]
-        lnL += log_likelihood_estimator(x0.unsqueeze(0), zbatch).detach().cpu()
 
-    return torch.stack(lnL)
+def create_log_likelihood_function(
+    log_likelihood_estimator: nn.Module, 
+    x0: Tensor, 
+    n_batch: int = 64
+):
+    """Partially evaluates get_lnL."""
+    return partial(
+        get_lnL, 
+        log_likelihood_estimator=log_likelihood_estimator, 
+        x0=x0, 
+        n_batch=n_batch
+    )
 
 
 ##########
@@ -391,6 +410,8 @@ class Network(nn.Module):
         self.z_scale = torch.nn.Parameter(z_std)
     
     def forward(self, x, z):
+        assert x.size(-1) == self.x_loc.size(0), "You must choose an x which is the same x.size(-1) as the training data!"
+        assert z.size(-1) == self.z_loc.size(0), "You must choose a z which is the same z.size(-1) as the training data!"
         x = (x-self.x_loc)/self.x_scale
         z = (z-self.z_loc)/self.z_scale
 
@@ -440,13 +461,13 @@ class Mask(object):
         threshold: ScalarFloat,
     ):
         """Classifies parameters as above or below the likelihood threshold.
-        The mask can only be applied to exactly the parameter combinations that defined the likelihood_estimator.
+        The mask can only be applied to exactly the parameter combinations that defined the log_likelihood_estimator.
         Mask evaluation takes place on the cpu.
 
         Args:
-            likelihood_estimator: Takes parameters of shape [b, zdim], returns a log likelihood [b, n_posteriors].
-            x0: Optimized observation.
-            threshold: Mask function returns true when likelihood_estimator(z) > log(treshold) for all posteriors.
+            x0: Observation.
+            log_likelihood_estimator: Takes parameters of shape [b, zdim], returns a log likelihood [b, n_posteriors].
+            threshold: Mask function returns true when log_likelihood_estimator(z) > log(treshold). Each posterior is evaluated independently.
         """
         self.log_likelihood_estimator = deepcopy(log_likelihood_estimator).eval().cpu()
         self.x0 = x0
@@ -467,7 +488,7 @@ class Mask(object):
 
         with torch.no_grad():
             lnL = get_lnL(self.log_likelihood_estimator, x0, z)
-            lnL -= lnL.max(axis=0)[0]
+            lnL -= lnL.max(axis=0).values
             verdict = lnL > np.log(self.threshold)
             return verdict.to(device)
 
