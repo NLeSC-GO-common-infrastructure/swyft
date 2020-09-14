@@ -2,9 +2,18 @@
 from typing import Callable, Optional
 
 import torch
-from torch.distributions.uniform import Uniform
 
 from .types import Tensor, Array
+
+
+class Uniform(torch.distributions.uniform.Uniform):
+    def log_prob(self, value):
+        f"""{torch.distributions.uniform.Uniform.__doc__}
+
+        Our version is modified to return torch.distributions.uniform.Uniform(value).min(dim=-1)
+        """
+        assert value.size(-1) == self.batch_shape[-1]
+        return super().log_prob(value).min(dim=-1)[0]
 
 
 def create_prior(

@@ -1,5 +1,6 @@
-# pylint: disable=no-member
+# pylint: disable=no-member, not-callable
 from typing import Optional, Union, Callable, Collection, Tuple
+from itertools import count
 
 import torch
 from torch.distributions.distribution import Distribution
@@ -15,7 +16,7 @@ def cull_masked_xzrounds(
     z: Array, 
     rounds: Optional[Array] = None
 ) -> Tuple[Array, Array, Optional[Array]]:
-    keep_inds = masking_fn(z)
+    keep_inds = masking_fn(z).all(dim=-1)
     x = x[keep_inds]
     z = z[keep_inds]
     if rounds is None:
@@ -25,20 +26,121 @@ def cull_masked_xzrounds(
         return x, z, rounds
 
 
-class ReuseSampler():
+class ReuseSampler(object):
     def __init__(
         self,
         data_cache: DataCache,
         target_prior: Distribution,
         epsilon: ScalarFloat,
+        available: Tensor = None,
     ):
-        """Utilize previously drawn data.
+        """Utilize previously drawn data while sampling from target_prior. 
+        keep is stateful, i.e. which samples were drawn is remembered.
         
         Args:
             data_cache: Stores the data from a particular round.
-            epsilon: Divides the log probablity density into layers of epsilon height.
+            target_prior: pytorch distribution.
+            epsilon: Divides the probablity density into layers of epsilon height.
+            available: Tensor indicating whether a certain z is already contained in the new sample.
         """
-        pass
+        self.x, self.z, self.rounds = cull_masked_xzrounds(
+            target_prior.support.check,
+            data_cache.x,
+            data_cache.z,
+            data_cache.rounds
+        )
+        self.target_prior = target_prior
+        self.data_prior = data_cache.prior
+        
+        # self.epsilon = epsilon  # It's just confusing to have two.
+        self.log_epsilon = torch.log(torch.tensor(epsilon))
+        self.available = torch.ones(self.z.size(0), dtype=torch.bool, device=self.x.device) if available is None else available 
+
+        self.data_prior_of_z = self.data_prior.log_prob(self.z)
+        self.data_prior_max = self.data_prior_of_z.max()
+        self.target_prior_of_z = self.target_prior.log_prob(self.z)
+        self.target_prior_max = self.target_prior_of_z.max()
+
+        self.data_prior_of_z_partition_bounds = self._get_partition(
+            self.data_prior_of_z,
+            self.data_prior_max,
+            self.log_epsilon
+        )
+        
+        self.previous_round = data_cache.round
+        self.next_round = self.previous_round + 1
+    
+    @staticmethod
+    def _get_partition(prior_of_z: Tensor, prior_max: ScalarFloat, log_epsilon: ScalarFloat) -> Tensor:
+        """Returns the bounds of the corresponding partition by log_epsilon in the last dimension.
+        There exists a p such that epsilon ** p < prior_of_z / prior_max < epsilon ** (p-1).
+
+        Returns:
+            lower_bound, upper_bound
+        """
+        print(prior_of_z.shape, prior_max.shape, log_epsilon.shape)
+        p = 1 + ((torch.log(prior_of_z) - torch.log(prior_max)) / log_epsilon)
+        p = torch.floor(p).to(torch.long)
+        return prior_max * log_epsilon ** p, prior_max * log_epsilon ** (p-1)
+    
+    @staticmethod
+    def _check_within_bounds(prior_of_z: Tensor, lower_bounds: Tensor, upper_bounds: Tensor) -> Tensor:
+        """Given M prior_of_z evaluations and N bounds, return an M x N boolean array where True implies that
+        prior_of_z_m is in between lower_bound_n and upper_bound_n.
+        """
+        assert prior_of_z.ndim == 1, f"{prior_of_z.ndim}"
+        assert lower_bounds.ndim == 1, f"{lower_bounds.ndim}" 
+        assert upper_bounds.ndim == 1, f"{upper_bounds.ndim}"
+        assert lower_bounds.shape == upper_bounds.shape, f"lower: {lower_bounds.shape}, upper: {upper_bounds.shape}"
+        
+        M = prior_of_z.size(0)
+        N = lower_bounds.size(0)
+
+        is_above = prior_of_z.unsqueeze(-1).expand(M, N) > lower_bounds
+        is_below = prior_of_z.unsqueeze(-1).expand(M, N) <= upper_bounds
+        return is_above & is_below
+
+    def sample(self, n: Optional[int] = None):
+        # Get the new samples
+        n = [1] if n is None else [n]
+        target_z = self.target_prior.sample(n)
+        data_prior_of_target_z = self.data_prior.log_prob(target_z)
+
+        if not self.available.any():
+            return target_z
+        
+        # Check if it is possible to use any old samples instead
+        target_z_partition_lower, target_z_partition_upper = self._get_partition(
+            data_prior_of_target_z, 
+            self.data_prior_max,  # TODO, is it okay to use the data_prior_max over the data, not the actual max?
+            self.log_epsilon
+        )
+        w = torch.rand(n).log()
+        stochastic_result = w > (data_prior_of_target_z / target_z_partition_upper)
+        data_prior_within_bounds = self._check_within_bounds(
+            self.data_prior_of_z,
+            target_z_partition_lower,
+            target_z_partition_upper,
+        ).t()
+        # TODO this is a problem because the uniform is flat and outside support its logpdf is -inf
+        # i.e. can't turn in to epsilon levels.
+        print(target_z_partition_lower)
+        print(target_z_partition_upper)
+
+        samples = []
+        for idx, tz, sr, wb in zip(count(), target_z, stochastic_result, data_prior_within_bounds):
+            if not self.available.any():
+                samples.append(tz)
+            elif sr:
+                samples.append(tz)
+            else:
+                print(self.available.any(), wb.any())
+                available_and_wb = self.available & wb
+                print(available_and_wb.any())
+                samples.append(self.z[available_and_wb][0])
+                self.available[[available_and_wb][0]] = False
+        samples = torch.stack(samples)
+        return torch.cat([samples, target_z[idx + 1:]])
 
 
 # Christoph's example
@@ -50,7 +152,7 @@ class DataStore:
         self.umax = umax
 
 
-class Sampler:
+class Sampler(object):
     def __init__(self, datastore, epsilon):
         self.epsilon = epsilon
         self.datastore = datastore
