@@ -6,7 +6,7 @@ import torch
 from .types import Tensor, Array
 
 
-class Uniform(torch.distributions.uniform.Uniform):
+class MultivariateUniform(torch.distributions.uniform.Uniform):
     def log_prob(self, value):
         f"""{torch.distributions.uniform.Uniform.__doc__}
 
@@ -65,7 +65,7 @@ def create_unconstraied_prior(
         lower_bound,
         upper_bound,
     )
-    return Uniform(lower_bound, upper_bound)
+    return MultivariateUniform(lower_bound, upper_bound)
 
 
 def create_constrained_prior(
@@ -97,7 +97,7 @@ def create_constrained_prior(
     lower_bounds = torch.stack(lower_bounds)
     upper_bounds = torch.stack(upper_bounds)
 
-    return Uniform(lower_bounds, upper_bounds)
+    return MultivariateUniform(lower_bounds, upper_bounds)
 
 
 if __name__ == "__main__":

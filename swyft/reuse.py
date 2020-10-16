@@ -56,33 +56,32 @@ class ReuseSampler(object):
         self.log_epsilon = torch.log(torch.tensor(epsilon))
         self.available = torch.ones(self.z.size(0), dtype=torch.bool, device=self.x.device) if available is None else available 
 
+        # TODO this has to be done elementwise by the prior from which each z was drawn.
         self.data_prior_of_z = self.data_prior.log_prob(self.z)
         self.data_prior_max = self.data_prior_of_z.max()
         self.target_prior_of_z = self.target_prior.log_prob(self.z)
         self.target_prior_max = self.target_prior_of_z.max()
 
-        self.data_prior_of_z_partition_bounds = self._get_partition(
-            self.data_prior_of_z,
-            self.data_prior_max,
-            self.log_epsilon
-        )
+        # self.data_prior_of_z_partition_bounds = self._get_partition(
+        #     self.data_prior_of_z,
+        #     self.data_prior_max,
+        #     self.log_epsilon
+        # )
         
         self.previous_round = data_cache.round
         self.next_round = self.previous_round + 1
     
     @staticmethod
-    def _get_partition(prior_of_z: Tensor, prior_max: ScalarFloat, log_epsilon: ScalarFloat) -> Tensor:
+    def _get_partition(log_prior_of_z: Tensor, log_prior_max: ScalarFloat, log_epsilon: ScalarFloat) -> Tensor:
         """Returns the bounds of the corresponding partition by log_epsilon in the last dimension.
-        There exists a p such that epsilon ** p < prior_of_z / prior_max < epsilon ** (p-1).
+        There exists a p such that epsilon * p < log_prior_of_z - log_prior_max < epsilon * (p-1).
 
         Returns:
             lower_bound, upper_bound
         """
-        print(prior_of_z.shape, prior_max.shape, log_epsilon.shape)
-        p = 1 + ((torch.log(prior_of_z) - torch.log(prior_max)) / log_epsilon)
-        p = torch.floor(p).to(torch.long)
-        return prior_max * log_epsilon ** p, prior_max * log_epsilon ** (p-1)
-    
+        p = 1 + torch.floor((log_prior_of_z - log_prior_max) / log_epsilon).to(torch.long)
+        return p * log_epsilon + log_prior_max, (p - 1) * log_epsilon + log_prior_max
+
     @staticmethod
     def _check_within_bounds(prior_of_z: Tensor, lower_bounds: Tensor, upper_bounds: Tensor) -> Tensor:
         """Given M prior_of_z evaluations and N bounds, return an M x N boolean array where True implies that
@@ -112,33 +111,31 @@ class ReuseSampler(object):
         # Check if it is possible to use any old samples instead
         target_z_partition_lower, target_z_partition_upper = self._get_partition(
             data_prior_of_target_z, 
-            self.data_prior_max,  # TODO, is it okay to use the data_prior_max over the data, not the actual max?
+            self.data_prior_max,  # TODO, is it okay to use the data_prior_max over the data, not the actual max?  # TODO make this also elementwise for each prior
             self.log_epsilon
         )
         w = torch.rand(n).log()
-        stochastic_result = w > (data_prior_of_target_z / target_z_partition_upper)
+        stochastic_result = w > (data_prior_of_target_z - target_z_partition_upper)
         data_prior_within_bounds = self._check_within_bounds(
             self.data_prior_of_z,
             target_z_partition_lower,
             target_z_partition_upper,
         ).t()
-        # TODO this is a problem because the uniform is flat and outside support its logpdf is -inf
-        # i.e. can't turn in to epsilon levels.
-        print(target_z_partition_lower)
-        print(target_z_partition_upper)
 
         samples = []
         for idx, tz, sr, wb in zip(count(), target_z, stochastic_result, data_prior_within_bounds):
+            available_and_wb = self.available & wb
             if not self.available.any():
                 samples.append(tz)
+                break
             elif sr:
                 samples.append(tz)
+            elif not available_and_wb.any():
+                samples.append(tz)
             else:
-                print(self.available.any(), wb.any())
-                available_and_wb = self.available & wb
-                print(available_and_wb.any())
                 samples.append(self.z[available_and_wb][0])
-                self.available[[available_and_wb][0]] = False
+                j = available_and_wb.tolist().index(True)
+                self.available[j] = False
         samples = torch.stack(samples)
         return torch.cat([samples, target_z[idx + 1:]])
 

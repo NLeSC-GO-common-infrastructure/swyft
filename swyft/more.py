@@ -141,10 +141,39 @@ class DataCache(object):
         super().__init__()
         self.round = current_round
         self.prior = prior
+        self.log_prior_max = None
         self.x = x
         self.z = z
         self.rounds = rounds
         self.model = model
+        # self.ReuseSampler  # TODO combine this with reuse then
+    
+    def sample_prior(self, n: Optional[int] = None):
+        """Sample from prior without reuse."""
+        n = [1] if n is None else [n]
+        z = self.prior.sample(n)
+        self.z = z if self.z is None else torch.cat([self.z, z])
+        rounds = torch.ones(n, dtype=torch.long) * self.round
+        self.rounds = rounds if self.rounds is None else torch.cat([self.rounds, rounds])
+
+    def simulate_z(self, z):
+        x = simulate(self.model, z)
+        self.x = x if self.x is None else torch.cat([x, self.x])
+
+    # TODO make it reuse first
+    def sample_simulate(self, n: Optional[int] = None):
+        """Sample from prior and simulate those samples."""
+        self.sample_prior(n)
+        if self.x is None:
+            self.simulate_z(self.z)
+        else:
+            num_simulated = len(self.x)
+            num_sampled = len(self.z)
+            num_to_simulate = num_sampled - num_simulated
+            assert num_to_simulate >= 0, f"There were more simulations {num_simulated} than prior samples {num_sampled}. How did that happen?"
+            
+            self.simulate_z(self.z[num_sampled:])
+            assert len(self.x) == len(self.z), f"After simulation, there were prior samples which did not have simulated pairs."
 
     def get_dataset(
         self,
